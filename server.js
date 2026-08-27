@@ -104,6 +104,23 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 // ---------------------------------------------------------------------------
 // POST /api/roadmap
 // body: { survey: {...survey fields...}, userContext: string }
+//
+// ORPHAN. No caller since session 37, when the Roadmap screen's AI block was deleted; the two
+// client functions and the three result types went with it, so nothing in the app can reach here
+// without new code. Session 62 called it directly to find out whether it still works.
+//
+// IT DOES. HTTP 200, a well-formed { milestones, nextStepTitle, nextStepDesc, modules }, on a
+// survey of seven fields. It is NOT retired because it broke.
+//
+// BUT IT TOOK 68.9 SECONDS, and the app's own deadline is AI_TIMEOUT_MS = 30,000
+// (src/utils/fetchWithTimeout.ts, session 58). Reconnecting this endpoint as it stands produces a
+// call the app aborts every single time. That is the first thing to fix, before the question of
+// whether the screen wants the feature back.
+//
+// NOT REMOVED, on purpose. See src/store/roadmapAi.ts for why the control exists with nothing
+// behind it, and the standing decision that the endpoint stays until the screen's question is
+// settled. Deleting a working endpoint to tidy up is how the roadmap feature got two false
+// blockers written about it in the first place.
 // ---------------------------------------------------------------------------
 app.post("/api/roadmap", async (req, res) => {
   try {
@@ -209,6 +226,15 @@ Include 6-8 items in "modules", ordered from foundational to more advanced.`;
 // ---------------------------------------------------------------------------
 // POST /api/roadmap/module-content
 // body: { survey: {...survey fields...}, moduleTitle: string, moduleDesc: string }
+//
+// ORPHAN, the same one, and it fed the six-module "Learning path" that went with the block.
+//
+// Session 62 called it: HTTP 200, { overview, keyConcepts, actionSteps }, in 25.8 SECONDS. That
+// clears the 30-second deadline by four seconds, which is not margin — a slower day fails. Of the
+// two orphans this is the one that could be reconnected first, and it is also the one with less
+// to reconnect to, because the module list it writes content FOR came from /api/roadmap above.
+//
+// NOT REMOVED. Same reasoning as above.
 // ---------------------------------------------------------------------------
 app.post("/api/roadmap/module-content", async (req, res) => {
   try {

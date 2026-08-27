@@ -3,7 +3,7 @@ import express from "express";
 import cors from "cors";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildResumeText } from "./lib/resumeText.js";
-import { SHARED_STANDARD, CRITIC_TASK, TAILORING_TASK } from "./lib/resumePrompt.js";
+import { SHARED_STANDARD_SYSTEM, CRITIC_TASK, TAILORING_TASK } from "./lib/resumePrompt.js";
 
 const PORT = process.env.PORT || 4001;
 const MODEL = "claude-opus-5";
@@ -27,9 +27,16 @@ function logUsage(path, response, startedAt) {
   const inTok = u.input_tokens ?? 0;
   const outTok = u.output_tokens ?? 0;
   const cached = u.cache_read_input_tokens ?? 0;
-  const cost = (inTok / 1e6) * PRICE_PER_MTOK.input + (outTok / 1e6) * PRICE_PER_MTOK.output;
+  // Session 61. A cache WRITE bills at 1.25x input and a READ at 0.1x, so a log that shows only
+  // `in` cannot tell a cheap call from an expensive one once caching is on.
+  const written = u.cache_creation_input_tokens ?? 0;
+  const cost =
+    (inTok / 1e6) * PRICE_PER_MTOK.input +
+    (written / 1e6) * PRICE_PER_MTOK.input * 1.25 +
+    (cached / 1e6) * PRICE_PER_MTOK.input * 0.1 +
+    (outTok / 1e6) * PRICE_PER_MTOK.output;
   console.log(
-    `[usage] ${path} model=${MODEL} in=${inTok} out=${outTok} cache_read=${cached} ` +
+    `[usage] ${path} model=${MODEL} in=${inTok} out=${outTok} cache_write=${written} cache_read=${cached} ` +
       `stop=${response?.stop_reason} ms=${Date.now() - startedAt} cost=$${cost.toFixed(4)}`
   );
 }
@@ -271,9 +278,7 @@ app.post("/api/resume/critique", async (req, res) => {
     const { resume = {} } = req.body || {};
     const resumeText = buildResumeText(resume);
 
-    const prompt = `${SHARED_STANDARD}
-
-${CRITIC_TASK}
+    const prompt = `${CRITIC_TASK}
 
 THE RESUME TO REVIEW
 ${resumeText}
@@ -292,6 +297,9 @@ Reference specific bullets or sections from the resume above. Plain text through
       model: MODEL,
       max_tokens: 8000,
       thinking: { type: "adaptive" },
+      // The standard is identical on every call to either resume endpoint, so it is cached and
+      // the two endpoints share one entry. See lib/resumePrompt.js for why that became possible.
+      system: SHARED_STANDARD_SYSTEM,
       messages: [{ role: "user", content: prompt }],
       output_config: {
         format: {
@@ -340,9 +348,7 @@ app.post("/api/resume/jd-compare", async (req, res) => {
     }
     const resumeText = buildResumeText(resume);
 
-    const prompt = `${SHARED_STANDARD}
-
-THE RESUME
+    const prompt = `THE RESUME
 ${resumeText}
 
 THE JOB DESCRIPTION
@@ -363,6 +369,8 @@ Respond with ONLY valid JSON, no markdown, no preamble, matching exactly:
       model: MODEL,
       max_tokens: 8000,
       thinking: { type: "adaptive" },
+      // Same cached block as /api/resume/critique, and deliberately byte-identical to it.
+      system: SHARED_STANDARD_SYSTEM,
       messages: [{ role: "user", content: prompt }],
       output_config: {
         format: {

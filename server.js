@@ -813,6 +813,114 @@ Respond with ONLY valid JSON, no markdown, no preamble, matching exactly:
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /api/brief
+// body: { name, title, company, notes, interactions: [{date, type}] (<=3), eventTitle, eventTime, aim }
+//
+// Session 125. The row-level brief: a "Brief" tap on a Today/Coming up row that matched to a
+// person, not the full-screen /api/meeting/brief above. The payload is deliberately narrower —
+// exactly the fields the app's privacy rule names for this feature (see ROW_BRIEF_SENDS_LINE in
+// the client) — three logged interactions rather than twenty, no warmth, no industry/school/
+// location/categories, no occasion field. NO REQUEST BODY IS LOGGED, on this endpoint or any
+// other in this file: only logUsage's token counts and classifyUpstream's error object ever
+// reach console output.
+// ---------------------------------------------------------------------------
+app.post("/api/brief", async (req, res) => {
+  try {
+    const {
+      name = "",
+      title = "",
+      company = "",
+      notes = "",
+      interactions = [],
+      eventTitle = "",
+      eventTime = "",
+      aim = "",
+    } = req.body || {};
+    if (!name.trim()) {
+      return res.status(400).json({ error: "name is required." });
+    }
+
+    const historyLines =
+      Array.isArray(interactions) && interactions.length > 0
+        ? interactions
+            .slice(0, 3)
+            .map((i) => `- ${i.date || "date unknown"}: ${i.type || "Contact"}`)
+            .join("\n")
+        : "- NOTHING LOGGED. There is no record of these two ever having been in contact.";
+
+    const prompt = `You are writing a very short pre-meeting brief for someone about to meet a person in their professional network. This is for a single row on their home screen, not a full report — it has room for at most four short lines.
+
+THE PERSON THEY ARE MEETING
+- Name: ${name}
+- Title: ${title || "not on file"}
+- Company: ${company || "not on file"}
+
+THEIR OWN NOTES ON THIS PERSON
+${notes.trim() || "(none)"}
+
+THEIR LAST THREE LOGGED INTERACTIONS WITH THIS PERSON, most recent first (there may be fewer than three, or none)
+${historyLines}
+
+THE MEETING THIS BRIEF IS FOR
+${eventTitle || "Untitled event"}, at ${eventTime || "an unknown time"}.
+
+WHAT THE USER IS GENERALLY AIMING AT
+${aim.trim() || "not specified"}
+
+DO NOT GUESS ABOUT THIS PERSON. You have been given everything the app knows about them, which
+is often very little. A field marked "not on file" is a fact, not an invitation to infer one — do
+not guess their seniority, what their company does, or anything else not stated above. Do not
+invent a shared history beyond what the interactions list actually shows, and do not assume they
+have met before if nothing is logged.
+
+Write at most 4 short lines. Each line is either a fact drawn from the record above, or a
+suggestion for the meeting phrased as one — never a generic line that would fit any meeting with
+anyone. Fewer than 4 lines is correct when the record does not support more; an empty list is
+correct when there is nothing to say. Plain text, sentence case, no em dashes, no exclamation
+marks, no markdown.
+
+Respond with ONLY valid JSON, no markdown formatting, no code fences, no preamble, matching
+exactly this shape:
+{
+  "lines": ["...", "..."]
+}`;
+
+    const startedAt = Date.now();
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 2000,
+      thinking: { type: "adaptive" },
+      messages: [{ role: "user", content: prompt }],
+      output_config: {
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: {
+              lines: { type: "array", items: { type: "string" } },
+            },
+            required: ["lines"],
+            additionalProperties: false,
+          },
+        },
+      },
+    });
+
+    logUsage(req.path, response, startedAt);
+
+    if (response.stop_reason === "refusal") {
+      return res.status(422).json({ error: "The model declined to write this brief." });
+    }
+
+    const textBlock = response.content.find((b) => b.type === "text");
+    if (!textBlock) return res.status(502).json({ error: "No text content returned from the model." });
+    res.json(JSON.parse(textBlock.text));
+  } catch (err) {
+    failed(res, req.path, err, "Failed to write a meeting brief.");
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`network-app-server listening on http://localhost:${PORT}`);
 });

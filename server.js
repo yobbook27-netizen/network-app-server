@@ -1109,6 +1109,89 @@ Respond with ONLY valid JSON, no markdown formatting, no code fences, no preambl
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /api/birthday-message
+// body: { firstName, relationship, title, company, notes, activities: [{ type, date }] } (<=3)
+//
+// Session 125b, Part 3. The fourth row in BirthdaySheet.tsx's picker, "Written for <First>":
+// one birthday message, at most 40 words, built from what is on record about the person and how
+// the user knows them. No web search, same shape as /api/brief and /api/next-step.
+// NO REQUEST BODY IS LOGGED.
+// ---------------------------------------------------------------------------
+app.post("/api/birthday-message", async (req, res) => {
+  try {
+    const { firstName = "", relationship = "", title = "", company = "", notes = "", activities = [] } = req.body || {};
+    if (!firstName.trim()) {
+      return res.status(400).json({ error: "firstName is required." });
+    }
+
+    const activityLines =
+      Array.isArray(activities) && activities.length > 0
+        ? activities
+            .slice(0, 3)
+            .map((a) => `- ${a.date || "date unknown"}: ${a.type || "Contact"}`)
+            .join("\n")
+        : "- Nothing logged with them yet.";
+
+    const prompt = `You are writing one short birthday text message for the user to send to somebody in their professional network. Below is everything on record about that person.
+
+FIRST NAME
+${firstName}
+
+HOW THE USER KNOWS THEM
+${relationship || "not specified"}
+
+TITLE AND COMPANY
+${title || "not on file"}${company ? ` at ${company}` : ""}
+
+THE USER'S OWN NOTES ON THEM
+${notes.trim() || "(none)"}
+
+LAST LOGGED INTERACTIONS WITH THEM, most recent first
+${activityLines}
+
+Write ONE birthday message, at most 40 words, warm, in the second person, as if the user is writing it themselves. You may mention at most one specific thing drawn from what is on record above — never invent a detail, a shared memory, a plan or anything not stated. One exclamation mark is allowed; use no more than one. Sentence case, no em dashes.
+
+Respond with ONLY valid JSON, no markdown formatting, no code fences, no preamble, matching exactly this shape:
+{
+  "message": "..."
+}`;
+
+    const startedAt = Date.now();
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 800,
+      thinking: { type: "adaptive" },
+      messages: [{ role: "user", content: prompt }],
+      output_config: {
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: {
+              message: { type: "string" },
+            },
+            required: ["message"],
+            additionalProperties: false,
+          },
+        },
+      },
+    });
+
+    logUsage(req.path, response, startedAt);
+
+    if (response.stop_reason === "refusal") {
+      return res.status(422).json({ error: "The model declined to write this one." });
+    }
+
+    const textBlock = response.content.find((b) => b.type === "text");
+    if (!textBlock) return res.status(502).json({ error: "No text content returned from the model." });
+    res.json(JSON.parse(textBlock.text));
+  } catch (err) {
+    failed(res, req.path, err, "Failed to write this one.");
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`network-app-server listening on http://localhost:${PORT}`);
 });

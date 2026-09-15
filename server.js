@@ -1020,6 +1020,95 @@ After you finish searching, your LAST message must contain ONLY the JSON below a
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /api/next-step
+// body: { aim: string, people: [{ name, title, company, lastLogged }] } (<=5)
+//
+// Session 125b, Part 2. Home's "Next step" half tile: one sentence naming one person from the
+// user's network whose title or company relates to their stated aim, plus one concrete thing to
+// ask or say. NO WEB SEARCH — this reads only what the app already knows about its own people,
+// the same shape of call as /api/brief, so output_config's json_schema format is used here (no
+// citations conflict). NO REQUEST BODY IS LOGGED.
+// ---------------------------------------------------------------------------
+app.post("/api/next-step", async (req, res) => {
+  try {
+    const { aim = "", people = [] } = req.body || {};
+    const candidates = (Array.isArray(people) ? people : [])
+      .filter((p) => p && typeof p.name === "string" && p.name.trim() !== "")
+      .slice(0, 5);
+    if (candidates.length === 0) {
+      return res.status(400).json({ error: "people is required." });
+    }
+
+    const peopleLines = candidates
+      .map(
+        (p, i) =>
+          `${i + 1}. ${p.name} — ${p.title || "role not on file"} at ${p.company || "company not on file"}. Last logged: ${p.lastLogged || "never"}.`
+      )
+      .join("\n");
+
+    const prompt = `You are suggesting one next step for someone managing their professional network. Below is their stated aim and up to five people already in their network whose title or company relates to it.
+
+THEIR AIM
+${aim.trim() || "not specified"}
+
+PEOPLE WHOSE TITLE OR COMPANY RELATES TO IT
+${peopleLines}
+
+Write ONE sentence naming exactly one of the people listed above by their EXACT name as given, with one concrete thing to ask or say to them, in a plain, understated voice: sentence case, no em dashes, no exclamation marks. Base it only on what is stated above — never invent a detail about the person, their role, their company or a shared history that isn't in the list.
+
+Respond with ONLY valid JSON, no markdown formatting, no code fences, no preamble, matching exactly this shape:
+{
+  "line": "...",
+  "personName": "..."
+}
+"personName" must be copied exactly, character for character, from one of the names in the list above.`;
+
+    const startedAt = Date.now();
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 1000,
+      thinking: { type: "adaptive" },
+      messages: [{ role: "user", content: prompt }],
+      output_config: {
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: {
+              line: { type: "string" },
+              personName: { type: "string" },
+            },
+            required: ["line", "personName"],
+            additionalProperties: false,
+          },
+        },
+      },
+    });
+
+    logUsage(req.path, response, startedAt);
+
+    if (response.stop_reason === "refusal") {
+      return res.status(422).json({ error: "The model declined to write a next step." });
+    }
+
+    const textBlock = response.content.find((b) => b.type === "text");
+    if (!textBlock) return res.status(502).json({ error: "No text content returned from the model." });
+    const parsed = JSON.parse(textBlock.text);
+
+    // The name must be one of the candidates verbatim — never trusted otherwise. The app
+    // resolves it back to a contact by exact match against the same list it sent.
+    const known = candidates.some((p) => p.name === parsed.personName);
+    if (!known) {
+      return res.status(502).json({ error: "The model named someone not on the list." });
+    }
+
+    res.json(parsed);
+  } catch (err) {
+    failed(res, req.path, err, "Failed to write a next step.");
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`network-app-server listening on http://localhost:${PORT}`);
 });

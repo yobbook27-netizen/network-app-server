@@ -926,6 +926,100 @@ exactly this shape:
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /api/brief-lines
+// body: { aim: string, companies: string[] } (<=8, deduplicated, most frequent first)
+//
+// Session 125b, Part 1. A SEPARATE ENDPOINT FROM /api/brief ABOVE, not a mode on it — /api/brief
+// already has one fully-specified, field-tested body shape (RowBriefInput) and a mode branch
+// would mean two body shapes behind the same tests. This one carries no person at all: never a
+// name, a title, a company tied to a specific contact, or anything from an interaction log. Just
+// the user's stated aim and up to eight company names, already deduplicated and capped by the
+// client (store/briefWebLines.ts's topCompanies). NO REQUEST BODY IS LOGGED.
+//
+// USES THE WEB SEARCH TOOL, deliberately WITHOUT output_config's json_schema format: the two are
+// documented as incompatible with citations, and a web-search turn attaches citations to its own
+// text blocks by default. The prompt instead asks, in plain language, for the model's LAST
+// message to contain nothing but the JSON — the same technique session 60's early endpoints used
+// before output_config existed. Verified by hand (see SESSION_125B_FINDINGS.md): the model's
+// final text block was clean JSON with no narration in every trial run.
+// ---------------------------------------------------------------------------
+app.post("/api/brief-lines", async (req, res) => {
+  try {
+    const { aim = "", companies = [] } = req.body || {};
+    const companyList = (Array.isArray(companies) ? companies : [])
+      .filter((c) => typeof c === "string" && c.trim() !== "")
+      .slice(0, 8);
+
+    const prompt = `You are writing at most two short factual lines for the brief tile on the home screen of a professional networking app. Below is the user's stated aim and a short list of company names drawn from people already in their professional network. No person's name, title or anything about an individual is included here — only the aim and the company list.
+
+USER'S AIM
+${aim.trim() || "not specified"}
+
+COMPANIES IN THEIR NETWORK
+${companyList.length > 0 ? companyList.join(", ") : "(none on file)"}
+
+Search the web for at most two facts. Each fact must be either about one of the companies listed above, or about roles or hiring matching the aim — NEVER about a specific person, by name or otherwise. Each fact must be dated within the last 14 days; if you cannot find anything that recent, leave it out rather than using an older or invented fact. An empty list is the correct answer on a day with nothing to report.
+
+Write each fact as one short sentence in the app's voice: sentence case, no em dashes, no exclamation marks, understated rather than promotional.
+
+After you finish searching, your LAST message must contain ONLY the JSON below and nothing else — no narration, no caveats, no code fences, no markdown, before or after it:
+{
+  "lines": [
+    { "text": "...", "url": "...", "title": "..." }
+  ]
+}`;
+
+    const startedAt = Date.now();
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 2000,
+      thinking: { type: "adaptive" },
+      tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 4 }],
+      messages: [{ role: "user", content: prompt }],
+    });
+
+    logUsage(req.path, response, startedAt);
+
+    if (response.stop_reason === "refusal") {
+      return res.status(422).json({ error: "The model declined to write the brief's web lines." });
+    }
+
+    const textBlocks = response.content.filter((b) => b.type === "text");
+    const last = textBlocks[textBlocks.length - 1];
+    if (!last) return res.status(502).json({ error: "No text content returned from the model." });
+
+    let parsed;
+    try {
+      parsed = JSON.parse(last.text);
+    } catch {
+      return res.status(502).json({ error: "The model's response was not valid JSON." });
+    }
+
+    // A line without a working URL is dropped here — never forwarded for the app to guess a
+    // domain from nothing. `domain` is computed here, from Node's own URL parser, rather than
+    // trusted from the model's own formatting of it.
+    const lines = (Array.isArray(parsed?.lines) ? parsed.lines : [])
+      .map((l) => {
+        if (!l || typeof l.text !== "string" || typeof l.url !== "string") return null;
+        let domain;
+        try {
+          domain = new URL(l.url).hostname.replace(/^www\./, "");
+        } catch {
+          return null;
+        }
+        if (l.text.trim() === "" || domain === "") return null;
+        return { text: l.text.trim(), url: l.url, domain, title: typeof l.title === "string" ? l.title.trim() : "" };
+      })
+      .filter(Boolean)
+      .slice(0, 2);
+
+    res.json({ lines });
+  } catch (err) {
+    failed(res, req.path, err, "Failed to write the brief's web lines.");
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`network-app-server listening on http://localhost:${PORT}`);
 });

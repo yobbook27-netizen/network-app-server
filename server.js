@@ -521,10 +521,15 @@ Respond with ONLY valid JSON, no markdown, no preamble, matching exactly:
 // POST /api/meeting/brief
 // body: { contact: {...}, survey: {...}, interactions: [...], notes: string, occasion: string }
 //
-// Pre-meeting prep: what the user already knows about this person, plus a few openers. The
-// contact's private fields (notes, ratings, logged interactions) ARE sent here, unlike
-// /api/templates/generate — the whole point of a brief is to summarize what's on file, and the
-// user is asking about their own record of their own contact.
+// ORPHAN as of session 125b, Part 0. Pre-meeting prep: what the user already knows about this
+// person, plus a few openers. The contact's private fields (notes, ratings, logged interactions)
+// ARE sent here, unlike /api/templates/generate — the whole point of a brief is to summarize
+// what's on file, and the user is asking about their own record of their own contact.
+//
+// MeetingBriefScreen.tsx's "Before" mode was its only caller and now calls /api/brief below
+// instead, with the same narrower payload the row-level brief uses — see generateRowBrief in
+// api/client.ts and Part 0 of SESSION_125B_FINDINGS.md. NOT REMOVED, same reasoning session 37
+// left /api/roadmap standing: the route is not what's wrong, the caller was.
 // ---------------------------------------------------------------------------
 app.post("/api/meeting/brief", async (req, res) => {
   try {

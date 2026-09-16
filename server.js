@@ -8,6 +8,14 @@ import { SHARED_STANDARD_SYSTEM, CRITIC_TASK, TAILORING_TASK } from "./lib/resum
 const PORT = process.env.PORT || 4001;
 const MODEL = "claude-opus-5";
 
+// Session 126, Part 1. `/api/brief-lines`'s per-company web search moved to this model: it is
+// the cheapest current model that still carries a web search tool. It is NOT in the
+// Opus 5/4.8/4.7/4.6, Sonnet 5, Sonnet 4.6 family the newer `web_search_20260209` dynamic-
+// filtering tool requires, so it uses the older `web_search_20250305` tool type instead — see
+// that endpoint below. It also does not support `thinking: {type: "adaptive"}` or
+// `output_config.effort` (both error on this model), so calls on it omit `thinking` entirely.
+const CHEAP_MODEL = "claude-haiku-4-5";
+
 if (!process.env.ANTHROPIC_API_KEY) {
   console.error(
     "Missing ANTHROPIC_API_KEY. Copy .env.example to .env in this directory and set your key, then restart."
@@ -21,8 +29,17 @@ const anthropic = new Anthropic();
 // Session 60. The handlers below already log their failures; nothing logged what a SUCCESS
 // spent, so the only record of the account draining was the invoice. `output_tokens` includes
 // adaptive thinking, which is where the money on this model actually goes.
-const PRICE_PER_MTOK = { input: 5.0, output: 25.0 }; // claude-opus-5, USD per 1M tokens
-function logUsage(path, response, startedAt) {
+//
+// Session 126: a second row, for CHEAP_MODEL. Every existing call site passes no fourth
+// argument and keeps billing against MODEL/claude-opus-5's rate; only `/api/brief-lines`'s
+// per-company calls pass `{ model: CHEAP_MODEL }`.
+const PRICE_TABLE = {
+  "claude-opus-5": { input: 5.0, output: 25.0 },
+  [CHEAP_MODEL]: { input: 1.0, output: 5.0 },
+}; // USD per 1M tokens
+function logUsage(path, response, startedAt, opts = {}) {
+  const { model = MODEL, note = "" } = opts;
+  const price = PRICE_TABLE[model] || PRICE_TABLE[MODEL];
   const u = response?.usage || {};
   const inTok = u.input_tokens ?? 0;
   const outTok = u.output_tokens ?? 0;
@@ -31,13 +48,13 @@ function logUsage(path, response, startedAt) {
   // `in` cannot tell a cheap call from an expensive one once caching is on.
   const written = u.cache_creation_input_tokens ?? 0;
   const cost =
-    (inTok / 1e6) * PRICE_PER_MTOK.input +
-    (written / 1e6) * PRICE_PER_MTOK.input * 1.25 +
-    (cached / 1e6) * PRICE_PER_MTOK.input * 0.1 +
-    (outTok / 1e6) * PRICE_PER_MTOK.output;
+    (inTok / 1e6) * price.input +
+    (written / 1e6) * price.input * 1.25 +
+    (cached / 1e6) * price.input * 0.1 +
+    (outTok / 1e6) * price.output;
   console.log(
-    `[usage] ${path} model=${MODEL} in=${inTok} out=${outTok} cache_write=${written} cache_read=${cached} ` +
-      `stop=${response?.stop_reason} ms=${Date.now() - startedAt} cost=$${cost.toFixed(4)}`
+    `[usage] ${path} model=${model} in=${inTok} out=${outTok} cache_write=${written} cache_read=${cached} ` +
+      `stop=${response?.stop_reason} ms=${Date.now() - startedAt} cost=$${cost.toFixed(4)}${note ? " " + note : ""}`
   );
 }
 /*
@@ -928,7 +945,11 @@ exactly this shape:
 
 // ---------------------------------------------------------------------------
 // POST /api/brief-lines
-// body: { aim: string, companies: string[] } (<=8, deduplicated, most frequent first)
+// body: { aim: string, companies: string[], date?: string, installId?: string }
+//   companies: <=8, deduplicated, most frequent first
+//   date: the calendar day (YYYY-MM-DD) the lines are FOR — the app's fetch-ahead call sends
+//     tomorrow's date while it is still today; falls back to the server's own day if absent.
+//   installId: a stable anonymous per-device id, for the per-user daily cap only.
 //
 // Session 125b, Part 1. A SEPARATE ENDPOINT FROM /api/brief ABOVE, not a mode on it — /api/brief
 // already has one fully-specified, field-tested body shape (RowBriefInput) and a mode branch
@@ -937,6 +958,23 @@ exactly this shape:
 // the user's stated aim and up to eight company names, already deduplicated and capped by the
 // client (store/briefWebLines.ts's topCompanies). NO REQUEST BODY IS LOGGED.
 //
+// Session 126, Part 1. RESTRUCTURED PER COMPANY, and onto CHEAP_MODEL. 125b's version sent the
+// whole company list and the aim in ONE call with up to 4 web searches, at $0.25 and 122-221s —
+// see SESSION_125B_FINDINGS.md. That call could never be shared between two users who happened
+// to both know someone at the same company. Splitting the work per company, cached by
+// (company, date) IN MEMORY (see companyFactCache below — a restart loses every cached fact and
+// every per-user cap counter; nothing else in this process persists to disk either), means the
+// SECOND user who has that company in their network that day costs nothing at all. At most
+// MAX_LIVE_SEARCHES fresh web searches run per incoming call regardless of how many companies
+// are on cache misses — the rest are left out of the response rather than guessed.
+//
+// THE AIM-RELATED ROLES LINE FROM 125b IS NOT KEPT. Joe's brief left that call optional
+// ("if kept, is its own cached call keyed to the aim text"); free-text aims are far less likely
+// to repeat across users than company names, so that call would rarely hit its cache and would
+// compete with company facts for the same MAX_LIVE_SEARCHES budget. `aim` stays in the request
+// body — Part 2 needs every AI request that carries an "aim" field to carry the correct one —
+// but this endpoint does not search on it.
+//
 // USES THE WEB SEARCH TOOL, deliberately WITHOUT output_config's json_schema format: the two are
 // documented as incompatible with citations, and a web-search turn attaches citations to its own
 // text blocks by default. The prompt instead asks, in plain language, for the model's LAST
@@ -944,77 +982,130 @@ exactly this shape:
 // before output_config existed. Verified by hand (see SESSION_125B_FINDINGS.md): the model's
 // final text block was clean JSON with no narration in every trial run.
 // ---------------------------------------------------------------------------
+const MAX_BRIEF_WEB_LINES = 2;
+const MAX_LIVE_SEARCHES = 2;
+// company|date -> { text, url, domain, title } | null. A `null` entry is a recorded "nothing
+// recent enough" result — it still counts as a cache hit, so a company with no news does not
+// get re-searched by the next user who asks about it that same day.
+const companyFactCache = new Map();
+// installId -> the set of requested `date` values already served for that install. Never
+// pruned — see the header above on what a restart loses.
+//
+// KEYED ON THE REQUESTED CONTENT DATE, NOT THE SERVER'S OWN WALL-CLOCK DAY. The app's normal
+// rhythm can produce two calls for one real calendar day: the background fetch-ahead (asking
+// for tomorrow while today is still today) and, on a day nobody opened the app yesterday, a
+// catch-up call at open (asking for today). Capping by wall-clock day would let whichever of
+// those two runs first use up the day's only slot and 429 the other — and since the catch-up
+// call exists specifically BECAUSE yesterday's fetch-ahead never landed, that 429 would always
+// land on the fetch-ahead call, which would then never land tomorrow either: a permanent
+// once-broken-always-broken loop. Keying on the content date instead means "today" and
+// "tomorrow" are different slots, and the cap still does its job — one call per install per
+// distinct day of content, however many real days that spans.
+const briefLinesCallDay = new Map();
+
+function companyFactPrompt(company) {
+  return `You are finding at most one short factual line about a company, for the brief tile on the home screen of a professional networking app. No person's name, title or anything about an individual should appear in your answer — only the company below.
+
+COMPANY
+${company}
+
+Search the web for at most one fact about this company. It must be dated within the last 14 days; if you cannot find anything that recent, say so rather than using an older or invented fact.
+
+Write the fact as one short sentence in the app's voice: sentence case, no em dashes, no exclamation marks, understated rather than promotional.
+
+After you finish searching, your LAST message must contain ONLY the JSON below and nothing else — no narration, no caveats, no code fences, no markdown, before or after it. If you found nothing recent enough, use "line": null.
+{
+  "line": { "text": "...", "url": "...", "title": "..." } | null
+}`;
+}
+
+// Shared by every per-company call: runs CHEAP_MODEL behind one web search, and returns the one
+// line it found or null. `note` is a plain string logged alongside the cost — see logUsage.
+async function fetchOneWebLine(path, prompt, note) {
+  const startedAt = Date.now();
+  const response = await anthropic.messages.create({
+    model: CHEAP_MODEL,
+    max_tokens: 800,
+    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }],
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  logUsage(path, response, startedAt, { model: CHEAP_MODEL, note });
+
+  if (response.stop_reason === "refusal") return null;
+
+  const textBlocks = response.content.filter((b) => b.type === "text");
+  const last = textBlocks[textBlocks.length - 1];
+  if (!last) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(last.text);
+  } catch {
+    return null;
+  }
+
+  // A line without a working URL is dropped here — never forwarded for the app to guess a
+  // domain from nothing. `domain` is computed here, from Node's own URL parser, rather than
+  // trusted from the model's own formatting of it.
+  const l = parsed?.line;
+  if (!l || typeof l.text !== "string" || typeof l.url !== "string") return null;
+  let domain;
+  try {
+    domain = new URL(l.url).hostname.replace(/^www\./, "");
+  } catch {
+    return null;
+  }
+  if (l.text.trim() === "" || domain === "") return null;
+  return { text: l.text.trim(), url: l.url, domain, title: typeof l.title === "string" ? l.title.trim() : "" };
+}
+
 app.post("/api/brief-lines", async (req, res) => {
   try {
-    const { aim = "", companies = [] } = req.body || {};
+    // eslint-disable-next-line no-unused-vars -- kept in the request shape for Part 2; not searched on, see header above.
+    const { aim = "", companies = [], date, installId } = req.body || {};
     const companyList = (Array.isArray(companies) ? companies : [])
       .filter((c) => typeof c === "string" && c.trim() !== "")
       .slice(0, 8);
 
-    const prompt = `You are writing at most two short factual lines for the brief tile on the home screen of a professional networking app. Below is the user's stated aim and a short list of company names drawn from people already in their professional network. No person's name, title or anything about an individual is included here — only the aim and the company list.
+    const requestDate =
+      typeof date === "string" && date.trim() !== "" ? date.trim() : new Date().toISOString().slice(0, 10);
 
-USER'S AIM
-${aim.trim() || "not specified"}
-
-COMPANIES IN THEIR NETWORK
-${companyList.length > 0 ? companyList.join(", ") : "(none on file)"}
-
-Search the web for at most two facts. Each fact must be either about one of the companies listed above, or about roles or hiring matching the aim — NEVER about a specific person, by name or otherwise. Each fact must be dated within the last 14 days; if you cannot find anything that recent, leave it out rather than using an older or invented fact. An empty list is the correct answer on a day with nothing to report.
-
-Write each fact as one short sentence in the app's voice: sentence case, no em dashes, no exclamation marks, understated rather than promotional.
-
-After you finish searching, your LAST message must contain ONLY the JSON below and nothing else — no narration, no caveats, no code fences, no markdown, before or after it:
-{
-  "lines": [
-    { "text": "...", "url": "...", "title": "..." }
-  ]
-}`;
-
-    const startedAt = Date.now();
-    const response = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 2000,
-      thinking: { type: "adaptive" },
-      tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 4 }],
-      messages: [{ role: "user", content: prompt }],
-    });
-
-    logUsage(req.path, response, startedAt);
-
-    if (response.stop_reason === "refusal") {
-      return res.status(422).json({ error: "The model declined to write the brief's web lines." });
+    // Per-user daily cap — see the header on briefLinesCallDay above for why this keys on
+    // `requestDate`, not the server's own wall-clock day.
+    const hasInstallId = typeof installId === "string" && installId.trim() !== "";
+    if (hasInstallId && briefLinesCallDay.get(installId)?.has(requestDate)) {
+      return res.status(429).json({ error: "Daily limit reached for this device." });
     }
 
-    const textBlocks = response.content.filter((b) => b.type === "text");
-    const last = textBlocks[textBlocks.length - 1];
-    if (!last) return res.status(502).json({ error: "No text content returned from the model." });
+    const lines = [];
+    let liveSearches = 0;
+    for (const raw of companyList) {
+      if (lines.length >= MAX_BRIEF_WEB_LINES) break;
+      const company = raw.trim();
+      const cacheKey = `${company.toLowerCase()}|${requestDate}`;
 
-    let parsed;
-    try {
-      parsed = JSON.parse(last.text);
-    } catch {
-      return res.status(502).json({ error: "The model's response was not valid JSON." });
+      if (companyFactCache.has(cacheKey)) {
+        const cached = companyFactCache.get(cacheKey);
+        console.log(`[usage] ${req.path} company="${company}" cache=hit cost=$0.0000`);
+        if (cached) lines.push(cached);
+        continue;
+      }
+      if (liveSearches >= MAX_LIVE_SEARCHES) continue; // left out, never guessed
+
+      liveSearches++;
+      const fact = await fetchOneWebLine(req.path, companyFactPrompt(company), `company="${company}" cache=miss`);
+      companyFactCache.set(cacheKey, fact);
+      if (fact) lines.push(fact);
     }
 
-    // A line without a working URL is dropped here — never forwarded for the app to guess a
-    // domain from nothing. `domain` is computed here, from Node's own URL parser, rather than
-    // trusted from the model's own formatting of it.
-    const lines = (Array.isArray(parsed?.lines) ? parsed.lines : [])
-      .map((l) => {
-        if (!l || typeof l.text !== "string" || typeof l.url !== "string") return null;
-        let domain;
-        try {
-          domain = new URL(l.url).hostname.replace(/^www\./, "");
-        } catch {
-          return null;
-        }
-        if (l.text.trim() === "" || domain === "") return null;
-        return { text: l.text.trim(), url: l.url, domain, title: typeof l.title === "string" ? l.title.trim() : "" };
-      })
-      .filter(Boolean)
-      .slice(0, 2);
+    if (hasInstallId) {
+      const served = briefLinesCallDay.get(installId) ?? new Set();
+      served.add(requestDate);
+      briefLinesCallDay.set(installId, served);
+    }
 
-    res.json({ lines });
+    res.json({ lines: lines.slice(0, MAX_BRIEF_WEB_LINES) });
   } catch (err) {
     failed(res, req.path, err, "Failed to write the brief's web lines.");
   }
@@ -1192,6 +1283,13 @@ Respond with ONLY valid JSON, no markdown formatting, no code fences, no preambl
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`network-app-server listening on http://localhost:${PORT}`);
-});
+// Session 126, Part 1. Guarded so `server.test.js` (node's built-in test runner) can import
+// `app` and `anthropic` below without binding a real port or making this file un-importable —
+// tests set NODE_ENV=test and start their own ephemeral listener.
+if (process.env.NODE_ENV !== "test") {
+  app.listen(PORT, () => {
+    console.log(`network-app-server listening on http://localhost:${PORT}`);
+  });
+}
+
+export { app, anthropic };
